@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proximity Radar Widget</title>
+    <style>
+        .widget-container {
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            width: min(100%, 300px);
+            min-width: 300px;
+            min-height: 300px;
+            margin: 0;
+
+            background-color: #2b2b2d;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.6);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #radarCanvas {
+            background-color: #222;
+            border-radius: 50%;
+            border: 2px solid #444;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="widget-container">
+        <canvas id="radarCanvas" width="300px" height="300px"></canvas>
+    </div>
+
+    <script>
+        const radarCanvas = document.getElementById('radarCanvas');
+        const radarCanvasCtx = radarCanvas.getContext('2d');
+
+        // Configuration
+        let width = radarCanvas.width;
+        let height = radarCanvas.height;
+        let centerX = width / 2;
+        let centerY = height / 2;
+        let maxRadius = Math.min(width, height) / 2 - 30; // Keep outer ring visible with margin
+        const maxDistanceCm = 500; // 5 meters (max range represented by maxRadius)
+
+        // MavLink values
+        let angleOffset = -38.77;
+        let incrementF = 1.076;
+        let distances = new Array(72).fill(65535); // Default to "out of range"
+
+        function resizeCanvasToContainer() {
+            const container = radarCanvas.parentElement;
+            const containerRect = container.getBoundingClientRect();
+            const containerStyle = getComputedStyle(container);
+            const horizontalPadding =
+                parseFloat(containerStyle.paddingLeft) + parseFloat(containerStyle.paddingRight);
+            const verticalPadding =
+                parseFloat(containerStyle.paddingTop) + parseFloat(containerStyle.paddingBottom);
+
+            const availableWidth = Math.max(0, containerRect.width - horizontalPadding);
+            const availableHeight = Math.max(0, containerRect.height - verticalPadding);
+
+            // Keep a square canvas that fits the available space.
+            const containerSize = availableHeight > 0
+                ? Math.min(availableWidth, availableHeight)
+                : availableWidth;
+            const size = Math.max(200, containerSize);
+            radarCanvas.width = size;
+            radarCanvas.height = size;
+
+            width = radarCanvas.width;
+            height = radarCanvas.height;
+            centerX = width / 2;
+            centerY = height / 2;
+            maxRadius = Math.max(20, (Math.min(width, height) / 2) - 30);
+        }
+
+        /**
+         * Renders the proximity radar.
+         * @param {number[]} distances - Array of 72 distances in cm.
+         * @param {number} angle_offset - Relative angle offset of the 0-index element.
+         * @param {number} increment_f - Angular width in degrees of each element.
+         */
+        function drawRadar(distances, angle_offset, increment_f) {
+            resizeCanvasToContainer();
+
+            // Clear canvas
+            radarCanvasCtx.clearRect(0, 0, width, height);
+
+            // 1. Draw Background Grid
+            drawGrid();
+
+            // 2. Draw Vehicle in Center
+            drawVehicle();
+
+            // 3. Draw Obstacles
+            for (let i = 0; i < distances.length; i++) {
+                let dist = distances[i];
+
+                // Ignore unknown values (65535) and out-of-range values (max_distance + 1)
+                if (dist === 65535 || dist > maxDistanceCm) {
+                    continue;
+                }
+
+                // Calculate angles
+                // Canvas 0 radians is at 3 o'clock. We want 0 degrees (forward) to be at 12 o'clock.
+                // So we subtract 90 degrees from our calculations.
+                const centerAngleDeg = angle_offset + (i * increment_f);
+
+                // Calculate start and end angles for the arc representing this sector
+                const startAngleDeg = centerAngleDeg - (increment_f / 2) - 90;
+                const endAngleDeg = centerAngleDeg + (increment_f / 2) - 90;
+
+                const startRad = startAngleDeg * (Math.PI / 180);
+                const endRad = endAngleDeg * (Math.PI / 180);
+
+                // Calculate radius in pixels based on distance
+                const rPx = (dist / maxDistanceCm) * maxRadius;
+
+                // Determine color based on proximity
+                let color = '#00ff00'; // Green
+                let fillColor = 'rgba(0, 255, 0, 0.45)';
+                if (dist < 100) {
+                    color = '#ff0000'; // Red (< 1m)
+                    fillColor = 'rgba(255, 0, 0, 0.45)';
+                } else if (dist < 200) {
+                    color = '#ffcc00'; // Yellow (< 2m)
+                    fillColor = 'rgba(255, 204, 0, 0.45)';
+                }
+
+                // Draw a thick sector band so detections are readable on small widgets.
+                const bandThickness = Math.max(8, maxRadius * 0.035);
+                const innerR = Math.max(0, rPx - bandThickness / 2);
+                const outerR = Math.min(maxRadius, rPx + bandThickness / 2);
+
+                radarCanvasCtx.save();
+                radarCanvasCtx.shadowColor = color;
+                radarCanvasCtx.shadowBlur = 8;
+
+                radarCanvasCtx.beginPath();
+                radarCanvasCtx.arc(centerX, centerY, outerR, startRad, endRad);
+                radarCanvasCtx.arc(centerX, centerY, innerR, endRad, startRad, true);
+                radarCanvasCtx.closePath();
+                radarCanvasCtx.fillStyle = fillColor;
+                radarCanvasCtx.fill();
+
+                radarCanvasCtx.lineWidth = 1.5;
+                radarCanvasCtx.strokeStyle = color;
+                radarCanvasCtx.stroke();
+
+                // Add a dot at the center angle for quick visual lock-on.
+                const midRad = (startRad + endRad) / 2;
+                const dotR = Math.max(2.5, bandThickness * 0.35);
+                radarCanvasCtx.beginPath();
+                radarCanvasCtx.arc(
+                    centerX + Math.cos(midRad) * rPx,
+                    centerY + Math.sin(midRad) * rPx,
+                    dotR,
+                    0,
+                    2 * Math.PI
+                );
+                radarCanvasCtx.fillStyle = color;
+                radarCanvasCtx.fill();
+                radarCanvasCtx.restore();
+            }
+        }
+
+        function drawGrid() {
+            radarCanvasCtx.strokeStyle = '#444';
+            radarCanvasCtx.fillStyle = '#00aa00';
+            radarCanvasCtx.font = '12px sans-serif';
+            radarCanvasCtx.textAlign = 'center';
+
+            // Draw concentric circles for 1m through 5m
+            for (let m = 1; m <= 5; m++) {
+                let r = (m * 100 / maxDistanceCm) * maxRadius;
+                radarCanvasCtx.beginPath();
+                radarCanvasCtx.arc(centerX, centerY, r, 0, 2 * Math.PI);
+                radarCanvasCtx.lineWidth = 1;
+                radarCanvasCtx.stroke();
+
+                // Labels
+                radarCanvasCtx.fillText(`${m}.0m`, centerX + 20, centerY - r + 5);
+            }
+
+            // Draw crosshairs
+            const angles = [0, 45, 90, 135, 180, 225, 270, 315];
+            angles.forEach(angle => {
+                const rad = (angle - 90) * (Math.PI / 180);
+                radarCanvasCtx.beginPath();
+                radarCanvasCtx.moveTo(centerX, centerY);
+                radarCanvasCtx.lineTo(centerX + Math.cos(rad) * maxRadius, centerY + Math.sin(rad) * maxRadius);
+                radarCanvasCtx.stroke();
+
+                // Label axes (excluding center)
+                const labelR = maxRadius + 15;
+                radarCanvasCtx.fillStyle = '#666';
+                radarCanvasCtx.fillText(`${angle}°`, centerX + Math.cos(rad) * labelR, centerY + Math.sin(rad) * labelR + 4);
+            });
+        }
+
+        function drawVehicle() {
+            radarCanvasCtx.fillStyle = '#00aaff';
+            radarCanvasCtx.beginPath();
+            // Draw a simple triangle pointing up
+            radarCanvasCtx.moveTo(centerX, centerY - 10);
+            radarCanvasCtx.lineTo(centerX - 8, centerY + 8);
+            radarCanvasCtx.lineTo(centerX + 8, centerY + 8);
+            radarCanvasCtx.fill();
+        }
+
+        // --- Simulation & Testing ---
+
+        // // Generate dummy data: 72 elements
+        // // Simulate an obstacle in front (0 degrees +/- a few increments) at 0.8m
+        // for (let i = 68; i < 72; i++) distances[i] = 80;
+        // for (let i = 0; i <= 4; i++) distances[i] = 80;
+
+        // // Simulate an obstacle on the right side (90 degrees, around index 18) at 1.5m
+        // for (let i = 15; i <= 21; i++) distances[i] = 150;
+
+        // // Simulate an obstacle on the bottom left (225 degrees, around index 45) at 2.5m
+        // for (let i = 43; i <= 47; i++) distances[i] = 250;
+
+        // Initial render and responsive redraw.
+        function render() {
+            drawRadar(distances, angleOffset, incrementF);
+        }
+
+        // Update widget when MavLink data changes
+        window.cockpit.listenDataLakeVariable("OBSTACLE_DISTANCE/angle_offset", (value) => {
+            angleOffset = value;
+            render();
+        });
+        window.cockpit.listenDataLakeVariable("OBSTACLE_DISTANCE/increment_f", (value) => {
+            incrementF = value;
+            render();
+        });
+        for (let i = 0; i < 72; i++) {
+            window.cockpit.listenDataLakeVariable(`OBSTACLE_DISTANCE/distances/${i}`, (value) => {
+                distances[i] = value;
+                render();
+            });
+        }
+
+        window.addEventListener('resize', render);
+        render();
+    </script>
+</body>
+
+</html>
