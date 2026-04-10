@@ -2,10 +2,10 @@ import requests
 import pprint
 
 streams =  {
-    "oak/depth": "Oak-D Stereo Disparity",
-    "oak/rgb": "Oak-D RGB"
+    "depth": "Oak-D Stereo Depth",
+    "rgb": "Oak-D RGB"
 }
-mcm_endpoint = "http://192.168.2.2:6020/streams"
+mcm_endpoint = "http://127.0.0.1:6020/streams"
 
 def has_oak_stream(current_streams, name):
     for stream in current_streams:
@@ -20,7 +20,7 @@ def add_mcm_stream(endpoint):
     "source": "Redirect",
     "stream_information": {
         "endpoints": [
-            f"rtsp://192.168.2.1:8554/{endpoint}"
+            f"rtsp://127.0.0.1:8554/{endpoint}"
         ],
         "configuration": {
             "type": "redirect"

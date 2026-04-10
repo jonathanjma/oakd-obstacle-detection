@@ -32,7 +32,7 @@ from gi.repository import Gst, GstRtspServer, GLib
 ######################################################
 
 DEPTH_WIDTH = 640
-DEPTH_HEIGHT = 400
+DEPTH_HEIGHT = 360
 FPS = 30
 DEPTH_RANGE_M = [0.1, 10.0]
 
@@ -71,8 +71,7 @@ debug_enable_default = 0
 ######################################################
 
 pipeline: dai.Pipeline = None
-raw_depth_queue: dai.MessageQueue = None
-rgb_queue: dai.MessageQueue = None
+oak_device: dai.Device = None
 calibration_handler: dai.CalibrationHandler = None
 
 # The name of the display window
@@ -241,30 +240,56 @@ def att_msg_callback(value):
 def oak_build_pipeline():
     p = dai.Pipeline()
 
-    # Depth Stream
-    mono_left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-    mono_right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-    out_left = mono_left.requestOutput((DEPTH_WIDTH*2, DEPTH_HEIGHT*2), fps=FPS, type=dai.ImgFrame.Type.NV12)
-    out_right = mono_right.requestOutput((DEPTH_WIDTH*2, DEPTH_HEIGHT*2), fps=FPS, type=dai.ImgFrame.Type.NV12)
-    stereo = p.create(dai.node.StereoDepth).build(out_left, out_right)
+    # Depth Stream (DepthAI v2 API)
+    mono_left = p.createMonoCamera()
+    mono_right = p.createMonoCamera()
+    stereo = p.createStereoDepth()
+    xout_depth = p.createXLinkOut()
+
+    mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+    mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+    mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+    mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+    mono_left.setFps(FPS)
+    mono_right.setFps(FPS)
+
+    mono_left.out.link(stereo.left)
+    mono_right.out.link(stereo.right)
+    stereo.depth.link(xout_depth.input)
+    xout_depth.setStreamName("depth")
+
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.ROBOTICS)
-    stereo.initialConfig.postProcessing.thresholdFilter.minRange = int(DEPTH_RANGE_M[0] * 1000)
-    stereo.initialConfig.postProcessing.thresholdFilter.maxRange = int(DEPTH_RANGE_M[1] * 1000)
+    stereo.initialConfig.PostProcessing.ThresholdFilter.minRange = int(DEPTH_RANGE_M[0] * 1000)
+    stereo.initialConfig.PostProcessing.ThresholdFilter.maxRange = int(DEPTH_RANGE_M[1] * 1000)
 
-    stereo.initialConfig.setConfidenceThreshold(40)
-    stereo.initialConfig.postProcessing.temporalFilter.enable = True
-    stereo.initialConfig.postProcessing.temporalFilter.alpha = 0.65
-    stereo.initialConfig.postProcessing.temporalFilter.persistencyMode = dai.StereoDepthConfig.PostProcessing.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_3
+    stereo.initialConfig.setConfidenceThreshold(255-50)
+    stereo.initialConfig.PostProcessing.TemporalFilter.enable = True
+    stereo.initialConfig.PostProcessing.TemporalFilter.alpha = 0.65
+    stereo.initialConfig.PostProcessing.TemporalFilter.PersistencyMode = dai.StereoDepthConfig.PostProcessing.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_3
 
-    raw_depth_queue = stereo.depth.createOutputQueue()
+    stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+    stereo.initialConfig.PostProcessing.SpeckleFilter.enable = True
+    stereo.initialConfig.PostProcessing.SpeckleFilter.speckleRange = 200
+    stereo.initialConfig.PostProcessing.SpatialFilter.enable = True
+    stereo.initialConfig.PostProcessing.SpatialFilter.holeFillingRadius = 2
+    stereo.initialConfig.PostProcessing.SpatialFilter.delta = 20
 
-    # RGB Stream Encoder
-    rgb_cam = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-    rgb_stream = rgb_cam.requestOutput((1280, 720), fps=FPS, type=dai.ImgFrame.Type.NV12)
-    rgb_enc = p.create(dai.node.VideoEncoder).build(rgb_stream, frameRate=FPS, profile=dai.VideoEncoderProperties.Profile.H264_MAIN)
-    rgb_queue = rgb_enc.out.createOutputQueue()
+    # RGB Stream Encoder (DepthAI v2 API)
+    rgb_cam = p.createColorCamera()
+    rgb_cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+    rgb_cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+    rgb_cam.setFps(FPS)
 
-    return p, raw_depth_queue, rgb_queue
+    rgb_enc = p.createVideoEncoder()
+    rgb_enc.setDefaultProfilePreset(FPS, dai.VideoEncoderProperties.Profile.H264_HIGH)
+
+    xout_rgb = p.createXLinkOut()
+    xout_rgb.setStreamName("rgb_encoded")
+
+    rgb_cam.video.link(rgb_enc.input)
+    rgb_enc.bitstream.link(xout_rgb.input)
+
+    return p
 
 
 def set_obstacle_distance_params():
@@ -473,12 +498,14 @@ mavlink_thread.start()
 
 send_msg_to_gcs("Connecting to OAK camera...")
 
-# Read user calibration using explicit Device API before starting the pipeline.
-with dai.Device(dai.UsbSpeed.HIGH) as calibration_device:
-    calibration_handler = calibration_device.readCalibration2()
+# Build pipeline and start device using DepthAI v2 API.
+pipeline = oak_build_pipeline()
+oak_device = dai.Device()
+calibration_handler = oak_device.readCalibration()
+oak_device.startPipeline(pipeline)
 
-pipeline, raw_depth_queue, rgb_queue = oak_build_pipeline()
-pipeline.start()
+raw_depth_queue = oak_device.getOutputQueue(name="depth")
+rgb_queue = oak_device.getOutputQueue(name="rgb_encoded")
 
 send_msg_to_gcs("OAK camera connected.")
 
@@ -501,14 +528,8 @@ else:
 
 if RTSP_STREAMING_ENABLE is True:
     if not register_streams():
-        send_msg_to_gcs("ERROR: Failed to register RTSP streams in MCM, exiting")
-        progress("ERROR: Failed to register RTSP streams in MCM, exiting")
-        if pipeline is not None:
-            pipeline.stop()
-        mavlink_thread_should_exit = True
-        mavlink_thread.join()
-        conn.close()
-        sys.exit(1)
+        send_msg_to_gcs("ERROR: Failed to register RTSP streams in MCM")
+        progress("ERROR: Failed to register RTSP streams in MCM")
 
     send_msg_to_gcs("RTSP at rtsp://" + get_local_ip() + ":" + RTSP_PORT + "/rgb and /depth")
     Gst.init(None)
@@ -602,8 +623,8 @@ finally:
     if glib_loop is not None:
         glib_loop.quit()
         glib_thread.join()
-    if pipeline is not None:
-        pipeline.stop()
+    if oak_device is not None:
+        oak_device.close()
     mavlink_thread_should_exit = True
     mavlink_thread.join()
     conn.close()
