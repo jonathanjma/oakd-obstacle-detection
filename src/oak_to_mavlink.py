@@ -5,7 +5,6 @@ os.environ["MAVLINK20"] = "1"
 import argparse
 import math as m
 import signal
-import socket
 import sys
 import threading
 import time
@@ -16,15 +15,7 @@ import cv2
 import depthai as dai
 import numpy as np
 
-from register_stream import register_streams
-
-# To setup video streaming
-import gi
-gi.require_version("Gst", "1.0")
-gi.require_version("GstRtspServer", "1.0")
-from gi.repository import Gst, GstRtspServer, GLib
-
-# export GI_TYPELIB_PATH="/opt/homebrew/lib/girepository-1.0"
+from stream import rtsp_init, rtsp_exit
 # export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH}"
 
 ######################################################
@@ -44,15 +35,14 @@ assert obstacle_line_height_ratio >= 0 and obstacle_line_height_ratio <= 1
 assert obstacle_line_thickness_pixel >= 1 and obstacle_line_thickness_pixel <= DEPTH_HEIGHT
 
 RTSP_STREAMING_ENABLE = True
-RTSP_PORT = "8554"
 
 ######################################################
 ##  ArduPilot-related parameters - reconfigurable   ##
 ######################################################
 
 # Default configurations for connection to the FCU
-# connection_string_default = "udpin:127.0.0.1:14001"
-connection_string_default = "udpout:192.168.2.2:14569"
+connection_string_default = "udpout:192.168.2.2:14569" # boat
+# connection_string_default = "tcp:127.0.0.1:5762" # sitl
 
 # Use this to rotate all processed data
 camera_facing_angle_degree = 0
@@ -64,7 +54,7 @@ obstacle_distance_msg_hz_default = 15.0
 
 mavlink_thread_should_exit = False
 
-debug_enable_default = 0
+debug_enable_default = 1
 
 ######################################################
 ##  Global variables                                ##
@@ -77,7 +67,6 @@ calibration_handler: dai.CalibrationHandler = None
 # The name of the display window
 display_name = "Input/output depth"
 rtsp_server = None
-glib_loop = None
 hover_depth_m = 0.0
 
 # Mouse callback function
@@ -262,7 +251,7 @@ def oak_build_pipeline():
     stereo.initialConfig.PostProcessing.ThresholdFilter.minRange = int(DEPTH_RANGE_M[0] * 1000)
     stereo.initialConfig.PostProcessing.ThresholdFilter.maxRange = int(DEPTH_RANGE_M[1] * 1000)
 
-    stereo.initialConfig.setConfidenceThreshold(255-50)
+    stereo.initialConfig.setConfidenceThreshold(255-50) # threshold is reversed, so 0 is highest confidence
     stereo.initialConfig.PostProcessing.TemporalFilter.enable = True
     stereo.initialConfig.PostProcessing.TemporalFilter.alpha = 0.65
     stereo.initialConfig.PostProcessing.TemporalFilter.PersistencyMode = dai.StereoDepthConfig.PostProcessing.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_3
@@ -270,9 +259,7 @@ def oak_build_pipeline():
     stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
     stereo.initialConfig.PostProcessing.SpeckleFilter.enable = True
     stereo.initialConfig.PostProcessing.SpeckleFilter.speckleRange = 200
-    stereo.initialConfig.PostProcessing.SpatialFilter.enable = True
-    stereo.initialConfig.PostProcessing.SpatialFilter.holeFillingRadius = 2
-    stereo.initialConfig.PostProcessing.SpatialFilter.delta = 20
+    stereo.initialConfig.PostProcessing.SpatialFilter.enable = False
 
     # RGB Stream Encoder (DepthAI v2 API)
     rgb_cam = p.createColorCamera()
@@ -416,70 +403,6 @@ def distances_from_depth_image(
             distances[i] = 65535
 
 ######################################################
-##  Functions - RTSP Streaming                      ##
-######################################################
-
-class SensorFactory(GstRtspServer.RTSPMediaFactory):
-    def __init__(self, kind, **properties):
-        super(SensorFactory, self).__init__(**properties)
-        self.kind = kind
-        if self.kind == "rgb":
-            self.launch_string = (
-                "appsrc name=source is-live=true block=true do-timestamp=true format=GST_FORMAT_TIME "
-                "caps=video/x-h264,stream-format=byte-stream,alignment=au,profile=main "
-                "! h264parse ! rtph264pay config-interval=1 name=pay0 pt=96"
-            )
-        else:
-            self.launch_string = (
-                "appsrc name=source is-live=true block=true do-timestamp=true format=GST_FORMAT_TIME "
-                f"caps=video/x-raw,format=BGR,width={DEPTH_WIDTH},height={DEPTH_HEIGHT},framerate={FPS}/1 "
-                "! videoconvert "
-                "! video/x-raw,format=I420 "
-                "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 "
-                "! rtph264pay config-interval=1 name=pay0 pt=96"
-            )
-        self.set_launch(self.launch_string)
-
-    def do_configure(self, rtsp_media):
-        self.appsrc = rtsp_media.get_element().get_child_by_name("source")
-
-
-class GstServer(GstRtspServer.RTSPServer):
-    def __init__(self, **properties):
-        super(GstServer, self).__init__(**properties)
-        self.set_service(RTSP_PORT)
-        self.rgb_factory = SensorFactory("rgb")
-        self.depth_factory = SensorFactory("depth")
-        self.rgb_factory.set_shared(True)
-        self.depth_factory.set_shared(True)
-        self.get_mount_points().add_factory("/rgb", self.rgb_factory)
-        self.get_mount_points().add_factory("/depth", self.depth_factory)
-        self.attach(None)
-
-    def send_data(self, kind, data):
-        factory = self.rgb_factory if kind == "rgb" else self.depth_factory
-        if hasattr(factory, "appsrc"):
-            if kind == "depth":
-                frame = np.ascontiguousarray(data)
-                payload = frame.tobytes()
-            else:
-                payload = bytes(data)
-            buf = Gst.Buffer.new_wrapped(payload)
-            factory.appsrc.emit("push-buffer", buf)
-
-
-def get_local_ip():
-    local_ip_address = "127.0.0.1"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 1)) # connect() for UDP doesn't send packets
-        local_ip_address = s.getsockname()[0]
-    except Exception:
-        local_ip_address = socket.gethostbyname(socket.gethostname())
-    return local_ip_address
-
-
-######################################################
 ##  Main code starts here                           ##
 ######################################################
 
@@ -527,16 +450,8 @@ else:
     sys.exit()
 
 if RTSP_STREAMING_ENABLE is True:
-    if not register_streams():
-        send_msg_to_gcs("ERROR: Failed to register RTSP streams in MCM")
-        progress("ERROR: Failed to register RTSP streams in MCM")
-
-    send_msg_to_gcs("RTSP at rtsp://" + get_local_ip() + ":" + RTSP_PORT + "/rgb and /depth")
-    Gst.init(None)
-    rtsp_server = GstServer()
-    glib_loop = GLib.MainLoop()
-    glib_thread = threading.Thread(target=glib_loop.run, args=())
-    glib_thread.start()
+    rtsp_server, msg = rtsp_init()
+    send_msg_to_gcs(msg)
 else:
     send_msg_to_gcs("RTSP not streaming")
 
@@ -566,7 +481,7 @@ try:
         # OAK depth output is millimeters
         depth_m = depth_raw_frame.getFrame().astype(np.float32) / 1000.0
 
-        obstacle_line_height = find_obstacle_line_height(DEPTH_HEIGHT // 2)
+        obstacle_line_height = find_obstacle_line_height(depth_m.shape[0])
         distances_from_depth_image(
             obstacle_line_height,
             depth_m,
@@ -620,9 +535,8 @@ except Exception as e:
 
 finally:
     progress("Closing the script...")
-    if glib_loop is not None:
-        glib_loop.quit()
-        glib_thread.join()
+    if RTSP_STREAMING_ENABLE is True:
+        rtsp_exit()
     if oak_device is not None:
         oak_device.close()
     mavlink_thread_should_exit = True
