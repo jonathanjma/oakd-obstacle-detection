@@ -28,13 +28,13 @@ FPS = 30
 DEPTH_RANGE_M = [0.1, 10.0]
 
 obstacle_line_height_ratio = 0.5  # [0-1]: 0-Top, 1-Bottom. The height of the horizontal line to find distance to obstacle.
-obstacle_line_thickness_pixel = 15 # [1-DEPTH_HEIGHT]: Number of pixel rows to use to generate the obstacle distance message. For each column, the scan will return the minimum value for those pixels centered vertically in the image.
+obstacle_line_thickness_pixel = 30 # [1-DEPTH_HEIGHT]: Number of pixel rows to use to generate the obstacle distance message. For each column, the scan will return the minimum value for those pixels centered vertically in the image.
 
 # Sanity check for depth configuration
 assert obstacle_line_height_ratio >= 0 and obstacle_line_height_ratio <= 1
 assert obstacle_line_thickness_pixel >= 1 and obstacle_line_thickness_pixel <= DEPTH_HEIGHT
 
-RTSP_STREAMING_ENABLE = True
+RTSP_STREAMING_ENABLE = False
 
 ######################################################
 ##  ArduPilot-related parameters - reconfigurable   ##
@@ -251,7 +251,7 @@ def oak_build_pipeline():
     stereo.initialConfig.PostProcessing.ThresholdFilter.minRange = int(DEPTH_RANGE_M[0] * 1000)
     stereo.initialConfig.PostProcessing.ThresholdFilter.maxRange = int(DEPTH_RANGE_M[1] * 1000)
 
-    stereo.initialConfig.setConfidenceThreshold(255-50) # threshold is reversed, so 0 is highest confidence
+    stereo.initialConfig.setConfidenceThreshold(255-35) # threshold is reversed, so 0 is highest confidence
     stereo.initialConfig.PostProcessing.TemporalFilter.enable = True
     stereo.initialConfig.PostProcessing.TemporalFilter.alpha = 0.65
     stereo.initialConfig.PostProcessing.TemporalFilter.PersistencyMode = dai.StereoDepthConfig.PostProcessing.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_3
@@ -386,21 +386,68 @@ def distances_from_depth_image(
         elif lower_pixel < 0:
             lower_pixel = 0
 
-        # Find min distance in the vertical line for each column
-        min_point_in_scan = np.min(
-            depth_mat_m[int(lower_pixel): int(upper_pixel), int(i * step)]
-        )
-        dist_m = float(min_point_in_scan)
+        # Extract all column pixels for this step
+        col_start = int(i * step)
+        col_end = int((i + 1) * step)
+        depth_slice = depth_mat_m[
+            int(lower_pixel):int(upper_pixel),
+            col_start:col_end
+        ]
 
-        # Distances array values: 
+        valid = depth_slice[
+            (depth_slice > min_depth_m) & (depth_slice < max_depth_m)
+        ]
+        # print(valid.size, depth_slice.size)
+
+        # Require minimum amount of valid pixels
+        if valid.size >= 25:
+            # report lower percentile to be more robust to noise and outliers
+            dist_m = float(np.percentile(valid, 15))
+        else:
+            dist_m = None
+
+        # Distances array values, IN CM not meters: 
         #   A value of max_distance + 1 (cm) means no obstacle is present. 
         #   A value of UINT16_MAX (65535) for unknown/not used.
-
-        # Note that dist_m is in meter, while distances[] is in cm.
-        if dist_m > min_depth_m and dist_m < max_depth_m:
+        if dist_m is not None:
             distances[i] = int(dist_m * 100)
         else:
             distances[i] = 65535
+
+    # check neighboring buckets to remove isolated spikes
+    for i in range(1, distances_array_length):
+        if distances[i] == 65535: 
+            continue
+        if distances[i - 1] == 65535 and distances[i + 1] == 65535:
+            distances[i] = 65535
+
+def draw_obstacle_bucket_overlay(image_bgr, obstacle_line_height, line_thickness, distances_cm):
+    """Draw one colored segment per obstacle bucket on the debug image."""
+    height, width = image_bgr.shape[:2]
+    y = int(np.clip(obstacle_line_height, 0, height - 1))
+    half_thickness = max(0, int(line_thickness // 2))
+    y1 = max(0, y - half_thickness)
+    y2 = min(height - 1, y + half_thickness)
+    step = width / distances_array_length
+
+    for i in range(distances_array_length):
+        x1 = int(i * step)
+        x2 = min(width - 1, int((i + 1) * step) - 1)
+        if x2 < x1:
+            x2 = x1
+
+        distance_cm = int(distances_cm[i])
+        if distance_cm == 65535:
+            color = (0, 0, 0)
+        else:
+            # Map all buckets to the same distance gradient.
+            norm = (distance_cm - min_depth_cm) / max(1, (max_depth_cm - min_depth_cm))
+            norm = float(np.clip(norm, 0.0, 1.0))
+            gradient_u8 = np.array([[int((1.0 - norm) * 255)]], dtype=np.uint8)
+            color = tuple(int(c) for c in cv2.applyColorMap(gradient_u8, cv2.COLORMAP_TURBO)[0, 0])
+
+        cv2.rectangle(image_bgr, (x1, y1), (x2, y2), color, thickness=-1)
+        cv2.rectangle(image_bgr, (x1, y1), (x2, y2), (255, 255, 255), thickness=1)
 
 ######################################################
 ##  Main code starts here                           ##
@@ -518,9 +565,17 @@ try:
             )
 
             # Draw a horizontal line to visualize the obstacles' line
-            x1, y1 = int(0), int(obstacle_line_height)
-            x2, y2 = int(DEPTH_WIDTH), int(obstacle_line_height)
-            cv2.line(depth_image, (x1, y1), (x2, y2), (0, 255, 0), thickness=obstacle_line_thickness_pixel)
+            # x1, y1 = int(0), int(obstacle_line_height)
+            # x2, y2 = int(DEPTH_WIDTH), int(obstacle_line_height)
+            # cv2.line(depth_image, (x1, y1), (x2, y2), (0, 255, 0), thickness=obstacle_line_thickness_pixel)
+
+            # Draw one color-coded segment per obstacle bucket along the scan line.
+            draw_obstacle_bucket_overlay(
+                depth_image,
+                obstacle_line_height,
+                obstacle_line_thickness_pixel,
+                distances,
+            )
 
             cv2.imshow(display_name, depth_image)
             cv2.waitKey(1)
