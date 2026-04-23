@@ -18,6 +18,7 @@ mcm_endpoint = "http://127.0.0.1:6020/streams"
 RTSP_PORT = "8554"
 glib_loop = None
 glib_thread = None
+DEPTH_WIDTH, DEPTH_HEIGHT, FPS = 0, 0, 0
 
 ######################################################
 ##  Functions - RTSP Streaming                      ##
@@ -34,7 +35,6 @@ class SensorFactory(GstRtspServer.RTSPMediaFactory):
                 "! h264parse ! rtph264pay config-interval=1 name=pay0 pt=96"
             )
         else:
-            from oak_to_mavlink import DEPTH_WIDTH, DEPTH_HEIGHT, FPS
             self.launch_string = (
                 "appsrc name=source is-live=true block=true do-timestamp=true format=GST_FORMAT_TIME "
                 f"caps=video/x-raw,format=BGR,width={DEPTH_WIDTH},height={DEPTH_HEIGHT},framerate={FPS}/1 "
@@ -135,11 +135,14 @@ def register_streams():
 
     return ok
 
-def rtsp_init():
+def rtsp_init(width, height, fps):
+    global DEPTH_WIDTH, DEPTH_HEIGHT, FPS
+    global glib_loop, glib_thread
+
     # if not register_streams():
     #     send_msg_to_gcs("ERROR: Failed to register RTSP streams in MCM")
     #     progress("ERROR: Failed to register RTSP streams in MCM")
-
+    DEPTH_WIDTH, DEPTH_HEIGHT, FPS = width, height, fps
     msg = "RTSP at rtsp://" + get_local_ip() + ":" + RTSP_PORT + "/rgb and /depth"
     Gst.init(None)
     rtsp_server = GstServer()
@@ -149,6 +152,8 @@ def rtsp_init():
     return rtsp_server, msg
 
 def rtsp_exit():
+    global glib_loop, glib_thread
+
     if glib_loop is not None:
         glib_loop.quit()
     if glib_thread is not None:

@@ -497,7 +497,7 @@ else:
     sys.exit()
 
 if RTSP_STREAMING_ENABLE is True:
-    rtsp_server, msg = rtsp_init()
+    rtsp_server, msg = rtsp_init(DEPTH_WIDTH, DEPTH_HEIGHT, FPS)
     send_msg_to_gcs(msg)
 else:
     send_msg_to_gcs("RTSP not streaming")
@@ -590,7 +590,7 @@ except Exception as e:
 
 finally:
     progress("Closing the script...")
-    if RTSP_STREAMING_ENABLE is True:
+    if RTSP_STREAMING_ENABLE:
         rtsp_exit()
     if oak_device is not None:
         oak_device.close()
