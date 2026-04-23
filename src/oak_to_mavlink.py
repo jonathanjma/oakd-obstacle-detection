@@ -16,6 +16,7 @@ import depthai as dai
 import numpy as np
 
 from stream import rtsp_init, rtsp_exit
+# ffplay -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 -sync video -rtsp_transport udp rtsp://127.0.0.1:8554/depth
 # export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH}"
 
 ######################################################
@@ -514,6 +515,10 @@ signal.signal(signal.SIGTERM, sigint_handler)
 
 main_loop_should_quit = False
 
+# Track device-side depth frame timing (not host loop timing).
+last_depth_device_ts = None
+last_rgb_device_ts = None
+
 # Begin of the main loop
 last_time = time.time()
 try:
@@ -521,6 +526,13 @@ try:
         depth_raw_frame = raw_depth_queue.get()
         if depth_raw_frame is None:
             continue
+        # print("Interframe time (host loop): %.2f ms" % ((time.time() - last_time)*1000))
+
+        # depth_device_ts = depth_raw_frame.getTimestampDevice()
+        # if last_depth_device_ts is not None:
+        #     frame_interval_ms = (depth_device_ts - last_depth_device_ts).total_seconds() * 1000.0
+        #     print("Depth frame interval (device ts): %.2f ms" % frame_interval_ms)
+        # last_depth_device_ts = depth_device_ts
 
         # Store the timestamp for MAVLink messages
         current_time_us = int(round(time.time() * 1000000))
@@ -546,10 +558,18 @@ try:
         # Handle Encoded Data for RTSP
         if RTSP_STREAMING_ENABLE and rtsp_server:
             rtsp_server.send_data('depth', depth_image)
-            
-            # while rgb_queue.has():
-            r_pkt = rgb_queue.get().getData()
-            rtsp_server.send_data('rgb', r_pkt)
+
+            # Loop time is 60ms so need to consume 1-2 frames to drain queue
+            while rgb_queue.has():
+                rgb_pkt = rgb_queue.get()
+                if rgb_pkt is None:
+                    continue
+                # rgb_device_ts = rgb_pkt.getTimestampDevice()
+                # if last_rgb_device_ts is not None:
+                #     rgb_interval_ms = (rgb_device_ts - last_rgb_device_ts).total_seconds() * 1000.0
+                #     print("RGB frame interval (device ts): %.2f ms" % rgb_interval_ms)
+                # last_rgb_device_ts = rgb_device_ts
+                rtsp_server.send_data('rgb', rgb_pkt.getData())
 
         if debug_enable == 1:
             # Show depth at current mouse position
@@ -582,7 +602,8 @@ try:
 
             # Print all the distances in a line
             # progress("%s" % (str(distances)))
-            last_time = time.time()
+        print("Loop time: %.2f ms" % ((time.time() - last_time)*1000))
+        last_time = time.time()
 
 except Exception as e:
     progress(e)
